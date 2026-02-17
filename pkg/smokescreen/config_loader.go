@@ -67,7 +67,10 @@ type yamlConfig struct {
 	MaxRequestRate        float64 `yaml:"max_request_rate"`
 	MaxRequestBurst       *int    `yaml:"max_request_burst"`
 
-	DNSTimeout            time.Duration `yaml:"dns_timeout"`
+	// Tunnel limiting (for long-lived CONNECT connections)
+	MaxConcurrentConnectTunnels int `yaml:"max_concurrent_connect_tunnels"`
+
+	DNSTimeout time.Duration `yaml:"dns_timeout"`
 }
 
 func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -224,6 +227,11 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		if err := c.SetRateLimits(yc.MaxConcurrentRequests, yc.MaxRequestRate, maxBurst); err != nil {
 			return err
 		}
+	}
+
+	// Set tunnel limit for CONNECT connections
+	if yc.MaxConcurrentConnectTunnels > 0 {
+		c.MaxConcurrentConnectTunnels = yc.MaxConcurrentConnectTunnels
 	}
 
 	if yc.DNSTimeout > 0 {

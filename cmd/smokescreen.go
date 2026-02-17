@@ -170,6 +170,11 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 			Value: smokescreen.DefaultMaxRequestBurst,
 			Usage: "Maximum burst capacity for rate limiting.\n\t\tMust be greater than max-request-rate when specified.\n\t\tOmit to use default (2x max-request-rate).",
 		},
+		cli.IntFlag{
+			Name:  "max-concurrent-connect-tunnels",
+			Value: smokescreen.DefaultMaxConcurrentConnectTunnels,
+			Usage: "Maximum number of concurrent CONNECT tunnels.\n\t\tUnlike max-concurrent-requests, this limits actual long-lived connections.\n\t\t0 = unlimited (default).",
+		},
 		cli.DurationFlag{
 			Name:  "dns-timeout",
 			Value: smokescreen.DefaultDNSTimeout,
@@ -331,6 +336,11 @@ func NewConfiguration(args []string, logger *log.Logger) (*smokescreen.Config, e
 			if err := conf.SetRateLimits(maxConcurrent, maxRate, maxBurst); err != nil {
 				return err
 			}
+		}
+
+		if c.IsSet("max-concurrent-connect-tunnels") {
+			maxTunnels := c.Int("max-concurrent-connect-tunnels")
+			conf.MaxConcurrentConnectTunnels = maxTunnels
 		}
 
 		if c.IsSet("dns-timeout") {

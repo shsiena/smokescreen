@@ -92,6 +92,9 @@ type SmokescreenContext struct {
 	// This is an explicit flag that ensures role reuse only for CONNECT MITM requests
 	// and prevents attacks that try to reuse the role for traditional HTTP proxy requests.
 	isConnectMitm bool
+	// tunnelSlotAcquired indicates whether a tunnel limiter slot was acquired for this connection.
+	// If true, the slot must be released when the connection closes.
+	tunnelSlotAcquired bool
 }
 
 // ExitStatus is used to log Smokescreen's connection status at shutdown time
@@ -117,6 +120,10 @@ func (e ExitStatus) String() string {
 }
 
 type denyError struct {
+	error
+}
+
+type tunnelLimitError struct {
 	error
 }
 
@@ -495,6 +502,15 @@ func dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	// cost incurred by Smokescreen.
 	sctx.cfg.MetricsClient.Timing("proxy_duration_ms", time.Since(sctx.start), 1)
 
+	// For CONNECT tunnels, acquire a tunnel limiter slot before dialing.
+	// Unlike the rate limiter, this tracks actual long-lived tunnel connections.
+	if sctx.ProxyType == connectProxy && sctx.cfg.TunnelLimiter != nil {
+		if !sctx.cfg.TunnelLimiter.Acquire() {
+			return nil, tunnelLimitError{ErrTunnelLimitExceeded}
+		}
+		sctx.tunnelSlotAcquired = true
+	}
+
 	var conn net.Conn
 	var err error
 
@@ -515,6 +531,13 @@ func dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 		sctx.cfg.MetricsClient.IncrWithTags("cn.atpt.total", map[string]string{"success": "false"}, 1)
 		sctx.cfg.ConnTracker.RecordAttempt(sctx.RequestedHost, false)
 		metrics.ReportConnError(sctx.cfg.MetricsClient, err)
+
+		// Release tunnel slot if acquired since connection failed
+		if sctx.tunnelSlotAcquired && sctx.cfg.TunnelLimiter != nil {
+			sctx.cfg.TunnelLimiter.Release()
+			sctx.tunnelSlotAcquired = false
+		}
+
 		return nil, err
 	}
 	sctx.cfg.MetricsClient.IncrWithTags("cn.atpt.total", map[string]string{"success": "true"}, 1)
@@ -525,6 +548,16 @@ func dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if sctx.ProxyType == connectProxy {
 		ic := sctx.cfg.ConnTracker.NewInstrumentedConnWithTimeout(conn, sctx.cfg.IdleTimeout, sctx.Logger, d.Role, d.OutboundHost, sctx.ProxyType, d.Project)
 		pctx.ConnErrorHandler = ic.Error
+
+		// Set up tunnel limiter release callback.
+		// The slot was acquired above right before dialing, and must be released when the connection closes.
+		if sctx.tunnelSlotAcquired && sctx.cfg.TunnelLimiter != nil {
+			ic.OnClose = func() {
+				sctx.cfg.TunnelLimiter.Release()
+				sctx.tunnelSlotAcquired = false
+			}
+		}
+
 		conn = ic
 	} else {
 		conn = NewTimeoutConn(conn, sctx.cfg.IdleTimeout)
@@ -596,6 +629,10 @@ func rejectResponse(pctx *goproxy.ProxyCtx, err error) *http.Response {
 		status = "Request rejected by proxy"
 		code = http.StatusProxyAuthRequired
 		msg = fmt.Sprintf(denyMsgTmpl, pctx.Req.Host, e.Error())
+	} else if e, ok := err.(tunnelLimitError); ok {
+		status = "Too Many Requests"
+		code = http.StatusTooManyRequests
+		msg = e.Error()
 	} else {
 		status = "Internal server error"
 		code = http.StatusInternalServerError
@@ -618,6 +655,11 @@ func rejectResponse(pctx *goproxy.ProxyCtx, err error) *http.Response {
 	resp.ProtoMajor = pctx.Req.ProtoMajor
 	resp.ProtoMinor = pctx.Req.ProtoMinor
 	resp.Header.Set(errorHeader, msg)
+	
+	// Add Retry-After header for tunnel limit errors
+	if _, ok := err.(tunnelLimitError); ok {
+		resp.Header.Set("Retry-After", "1")
+	}
 	if sctx.cfg.RejectResponseHandler != nil {
 		sctx.cfg.RejectResponseHandler(resp)
 	}
@@ -719,7 +761,7 @@ func BuildProxy(config *Config) *goproxy.ProxyHttpServer {
 			existingSctx, ok := pctx.UserData.(*SmokescreenContext)
 			if !ok || existingSctx.Decision == nil {
 				config.Log.WithFields(logrus.Fields{
-					"context_valid": ok,
+					"context_valid":    ok,
 					"decision_present": existingSctx != nil && existingSctx.Decision != nil,
 				}).Error("MITM request missing required context or decision from CONNECT phase - rejecting request")
 				err := errors.New("MITM request missing context from CONNECT phase")
@@ -1021,6 +1063,14 @@ func StartWithConfig(config *Config, quit <-chan interface{}) {
 			config.MaxConcurrentRequests, config.MaxRequestRate, config.MaxRequestBurst)
 	}
 
+	if config.MaxConcurrentConnectTunnels > 0 {
+		config.initializeTunnelLimiter()
+		if config.TunnelLimiter != nil {
+			config.Log.Printf("CONNECT tunnel limiting enabled (max_concurrent_tunnels=%d)",
+				config.MaxConcurrentConnectTunnels)
+		}
+	}
+
 	if config.Healthcheck != nil {
 		handler = &HealthcheckMiddleware{
 			Proxy:       handler,
@@ -1274,13 +1324,13 @@ func checkACLsForRequest(config *Config, sctx *SmokescreenContext, req *http.Req
 
 	var role string
 	var roleErr error
-	
+
 	// Check if role is already populated in SmokescreenContext (e.g., from CONNECT in MITM mode)
 	if sctx.isConnectMitm {
 		if sctx.Decision == nil || sctx.Decision.Role == "" {
 			config.Log.WithFields(logrus.Fields{
-				"decision_nil":  sctx.Decision == nil,
-				"role_empty":    sctx.Decision != nil && sctx.Decision.Role == "",
+				"decision_nil": sctx.Decision == nil,
+				"role_empty":   sctx.Decision != nil && sctx.Decision.Role == "",
 			}).Error("MITM request missing required role from CONNECT phase")
 			config.MetricsClient.Incr("acl.role_not_determined", 1)
 			decision.Reason = "Client role cannot be determined"
@@ -1288,7 +1338,7 @@ func checkACLsForRequest(config *Config, sctx *SmokescreenContext, req *http.Req
 		}
 		role = sctx.Decision.Role
 		config.Log.WithFields(logrus.Fields{
-			"role": role,
+			"role":        role,
 			"destination": destination.String(),
 		}).Info("Reusing existing role from context (MITM)")
 	} else {

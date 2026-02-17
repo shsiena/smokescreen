@@ -43,6 +43,10 @@ type InstrumentedConn struct {
 
 	closed     bool
 	CloseError error
+
+	// OnClose is called when the connection is closed.
+	// This can be used to release resources like tunnel limiter slots.
+	OnClose func()
 }
 
 func (t *Tracker) NewInstrumentedConnWithTimeout(conn net.Conn, timeout time.Duration, logger *logrus.Entry, role, outboundHost, proxyType, project string) *InstrumentedConn {
@@ -90,6 +94,11 @@ func (ic *InstrumentedConn) Close() error {
 
 	ic.closed = true
 	ic.tracker.Delete(ic)
+
+	// Call OnClose callback if set (e.g., to release tunnel limiter slot)
+	if ic.OnClose != nil {
+		ic.OnClose()
+	}
 
 	end := time.Now()
 	duration := end.Sub(ic.Start).Seconds()

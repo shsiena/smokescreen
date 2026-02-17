@@ -29,11 +29,11 @@ import (
 // Configuration defaults
 const (
 	// Server defaults
-	DefaultPort              uint16        = 4750
-	DefaultConnectTimeout                  = 10 * time.Second
-	DefaultExitTimeout                     = 500 * time.Minute
-	DefaultNetwork             = "ip"
-	DefaultStatsSocketFileMode = 0700
+	DefaultPort                uint16 = 4750
+	DefaultConnectTimeout             = 10 * time.Second
+	DefaultExitTimeout                = 500 * time.Minute
+	DefaultNetwork                    = "ip"
+	DefaultStatsSocketFileMode        = 0700
 
 	// HTTP server timeouts
 	DefaultReadHeaderTimeout = 300 * time.Second
@@ -52,9 +52,10 @@ const (
 	DefaultStatsdAddress = "127.0.0.1:8200"
 
 	// Rate limiting defaults
-	DefaultMaxConcurrentRequests = 0    // 0 = unlimited
-	DefaultMaxRequestRate        = 0.0  // 0 = unlimited
-	DefaultMaxRequestBurst       = -1   // -1 = use 2x rate
+	DefaultMaxConcurrentRequests 	   = 0   // 0 = unlimited
+	DefaultMaxRequestRate              = 0.0 // 0 = unlimited
+	DefaultMaxRequestBurst             = -1  // -1 = use 2x rate
+	DefaultMaxConcurrentConnectTunnels = 0   // 0 = unlimited
 )
 
 type RuleRange struct {
@@ -177,6 +178,15 @@ type Config struct {
 	// MaxRequestBurst is the maximum number of requests allowed in a burst.
 	// Set to 0 to use default (2x MaxRequestRate).
 	MaxRequestBurst int
+
+	// MaxConcurrentConnectTunnels limits the number of active CONNECT tunnels.
+	// Unlike MaxConcurrentRequests which only limits request processing time,
+	// this limits the actual number of long-lived tunnel connections.
+	// Set to 0 to disable tunnel limiting.
+	MaxConcurrentConnectTunnels int
+
+	// TunnelLimiter is used internally to enforce MaxConcurrentConnectTunnels.
+	TunnelLimiter *TunnelLimiter
 
 	// DNSTimeout is the maximum time to wait for DNS resolution.
 	// Set to 0 to use default (5 seconds).
@@ -343,20 +353,28 @@ func (config *Config) SetRateLimits(maxConcurrent int, maxRate float64, maxReque
 	if maxRate < 0 {
 		return fmt.Errorf("maxRate must be >= 0, got %.2f", maxRate)
 	}
-	
+
 	if maxRequestBurst >= 0 && maxRate > 0 && float64(maxRequestBurst) <= maxRate {
 		return fmt.Errorf("maxRequestBurst (%d) must be greater than maxRequestRate (%.2f); omit to use default (2x rate)", maxRequestBurst, maxRate)
 	}
-	
+
 	// Apply default: 2x rate when not explicitly configured or configured negative
 	if maxRequestBurst < 0 {
 		maxRequestBurst = int(maxRate * 2)
 	}
-	
+
 	config.MaxConcurrentRequests = maxConcurrent
 	config.MaxRequestRate = maxRate
 	config.MaxRequestBurst = maxRequestBurst
 	return nil
+}
+
+// initializeTunnelLimiter creates the TunnelLimiter if MaxConcurrentConnectTunnels
+// is set but the limiter hasn't been initialized yet.
+func (config *Config) initializeTunnelLimiter() {
+	if config.MaxConcurrentConnectTunnels > 0 && config.TunnelLimiter == nil {
+		config.TunnelLimiter = NewTunnelLimiter(config.MaxConcurrentConnectTunnels, config)
+	}
 }
 
 // RFC 5280,  4.2.1.1
