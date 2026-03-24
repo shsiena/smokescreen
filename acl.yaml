@@ -1,0 +1,11 @@
+---
+version: v1
+services: []
+
+default:
+  project: default
+  action: open
+
+global_deny_list:
+  - "*.railway.internal"
+  - railway.internal
